@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs the WhatsApp bridge in the background on macOS: started at login, restarted if it stops.
+  Replace REPO with the absolute path of this repository and HOME with your home folder, then:
+    cp launchd/com.whatsapp-mcp.bridge.plist.example ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.whatsapp-mcp.bridge.plist
+  Scan the QR code once by running the bridge by hand first (it prints it in the terminal).
+  Stop it with: launchctl bootout gui/$(id -u)/com.whatsapp-mcp.bridge
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.whatsapp-mcp.bridge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>REPO/whatsapp-bridge/whatsapp-bridge</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>REPO/whatsapp-bridge</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>HOME/Library/Logs/whatsapp-bridge.log</string>
+	<key>StandardErrorPath</key>
+	<string>HOME/Library/Logs/whatsapp-bridge.log</string>
+</dict>
+</plist>

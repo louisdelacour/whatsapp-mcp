@@ -1,6 +1,6 @@
 # WhatsApp MCP Server
 
-This is a Model Context Protocol (MCP) server for WhatsApp.
+This is a Model Context Protocol (MCP) server for WhatsApp, a maintained fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) (see *What this fork adds* below).
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
@@ -13,6 +13,44 @@ Here's an example of what you can do when it's connected to Claude.
 > To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
+
+## What this fork adds
+
+The original project has not been updated since July 2025. This fork keeps it working and adds what daily use needs:
+
+- **Connects again**: whatsmeow updated, which fixes `Client outdated (405)` at the QR code.
+- **Safer bridge**: the REST API listens on `127.0.0.1` only (it was open to the whole local network, unauthenticated).
+- **Media downloads work**: the signed part of the media path (`oh`, `oe`…) is kept, so WhatsApp no longer answers 403.
+- **Real names**: chats and group members are named from your contacts (address book, WhatsApp or business name, LIDs mapped to phone numbers), refreshed as contacts sync.
+- **Edit and delete** your messages (`edit_message`, within ~15 minutes; `delete_message`, for everyone). `send_message` returns the sent message's `message_id`, and every listed message shows its id.
+- **Quoted replies**: `send_message(..., reply_to=<message_id>)`.
+- **Unread**: `list_unread` lists chats with messages since you last read them on any of your devices (own read receipts) or last wrote in them; `mark_as_read` sends the blue ticks.
+- **Local voice transcription**: `transcribe_voice` transcribes a voice message on your machine with [whisper.cpp](https://github.com/ggml-org/whisper.cpp), nothing leaves it; transcripts are cached.
+- **Runs in the background on macOS**: a launchd template in `launchd/`.
+
+### Install (macOS)
+
+```bash
+brew install go uv ffmpeg whisper-cpp
+git clone <this fork> whatsapp-mcp && cd whatsapp-mcp
+cd whatsapp-bridge && go build -o whatsapp-bridge . && ./whatsapp-bridge   # scan the QR code, then Ctrl-C
+cd ../whatsapp-mcp-server && uv sync
+mkdir -p ../models && curl -L -o ../models/ggml-large-v3-turbo.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin   # 1.6 GB
+```
+
+Run the bridge in the background with `launchd/com.whatsapp-mcp.bridge.plist.example` (instructions inside), then add the server to Claude Code in `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "whatsapp": { "type": "stdio", "command": "/opt/homebrew/bin/uv",
+    "args": ["--directory", "<repo>/whatsapp-mcp-server", "run", "main.py"] }
+}
+```
+
+`WHISPER_MODEL` and `WHISPER_LANGUAGE` (default `auto`) change the transcription model and language.
+
+**Never publish `whatsapp-bridge/store/`**: it holds your WhatsApp session keys, your messages and transcripts (it is in `.gitignore`).
 
 ## Installation
 

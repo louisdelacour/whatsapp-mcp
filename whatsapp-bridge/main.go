@@ -191,8 +191,23 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
+	ChatJID   string `json:"chat_jid,omitempty"`
+}
+
+// EditMessageRequest changes the text of a message we sent (WhatsApp allows ~15 minutes)
+type EditMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	Message   string `json:"message"`
+}
+
+// DeleteMessageRequest deletes a message we sent, for everyone
+type DeleteMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -200,12 +215,13 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	ReplyTo   string `json:"reply_to,omitempty"` // id of a message of the same chat to quote
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, quote func(types.JID) (*waProto.ContextInfo, error)) (bool, string, string, string, time.Time) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", "", "", time.Time{}
 	}
 
 	// Create JID for recipient
@@ -219,7 +235,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), "", "", time.Time{}
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +252,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), "", "", time.Time{}
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +301,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), "", "", time.Time{}
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +331,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), "", "", time.Time{}
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -357,18 +373,24 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if quote != nil {
+		ctxInfo, err := quote(recipientJID)
+		if err != nil {
+			return false, fmt.Sprintf("Error quoting message: %v", err), "", "", time.Time{}
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{Text: proto.String(message), ContextInfo: ctxInfo}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sent, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), "", "", time.Time{}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), sent.ID, recipientJID.String(), sent.Timestamp
 }
 
 // Extract media info from a message
@@ -641,7 +663,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -668,8 +690,20 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// Keep the query (ccb, oh, oe, _nc_sid sign the path: without them the media server answers 403),
+	// drop only mms3, which belongs to the full URL and not to the direct path
+	if pp := strings.SplitN(pathPart, "?", 2); len(pp) == 2 {
+		kept := []string{}
+		for _, kv := range strings.Split(pp[1], "&") {
+			if kv != "" && !strings.HasPrefix(kv, "mms3=") {
+				kept = append(kept, kv)
+			}
+		}
+		pathPart = pp[0]
+		if len(kept) > 0 {
+			pathPart += "?" + strings.Join(kept, "&")
+		}
+	}
 
 	// Create proper direct path format
 	return "/" + pathPart
@@ -706,7 +740,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		var quote func(types.JID) (*waProto.ContextInfo, error)
+		if req.ReplyTo != "" {
+			quote = func(chat types.JID) (*waProto.ContextInfo, error) {
+				return buildQuote(client, messageStore, chat, req.ReplyTo)
+			}
+		}
+		success, message, sentID, sentChat, sentAt := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, quote)
+		if success && req.Message != "" && client.Store.ID != nil {
+			if err := messageStore.StoreChat(sentChat, sentChat, sentAt); err != nil {
+				fmt.Println("Failed to store chat of sent message:", err)
+			}
+			if err := messageStore.StoreMessage(sentID, sentChat, client.Store.ID.User, req.Message, sentAt, true,
+				"", "", "", nil, nil, nil, 0); err != nil {
+				fmt.Println("Failed to store sent message:", err)
+			}
+		}
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -718,9 +767,73 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: sentID,
+			ChatJID:   sentChat,
 		})
+	})
+
+	// Handler for editing a message we sent
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req EditMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" || req.MessageID == "" || req.Message == "" {
+			http.Error(w, "chat_jid, message_id and message are required", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error parsing JID: %v", err)})
+			return
+		}
+		edit := client.BuildEdit(chatJID, types.MessageID(req.MessageID), &waProto.Message{Conversation: proto.String(req.Message)})
+		if _, err := client.SendMessage(context.Background(), chatJID, edit); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error editing message: %v", err)})
+			return
+		}
+		if _, err := messageStore.db.Exec("UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?", req.Message, req.MessageID, req.ChatJID); err != nil {
+			fmt.Println("Failed to update edited message:", err)
+		}
+		fmt.Println("Edited message", req.MessageID)
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message edited", MessageID: req.MessageID, ChatJID: req.ChatJID})
+	})
+
+	// Handler for deleting a message we sent, for everyone
+	http.HandleFunc("/api/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req DeleteMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error parsing JID: %v", err)})
+			return
+		}
+		revoke := client.BuildRevoke(chatJID, types.EmptyJID, types.MessageID(req.MessageID))
+		if _, err := client.SendMessage(context.Background(), chatJID, revoke); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error deleting message: %v", err)})
+			return
+		}
+		if _, err := messageStore.db.Exec("DELETE FROM messages WHERE id = ? AND chat_jid = ?", req.MessageID, req.ChatJID); err != nil {
+			fmt.Println("Failed to remove deleted message:", err)
+		}
+		fmt.Println("Deleted message", req.MessageID)
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message deleted for everyone", MessageID: req.MessageID, ChatJID: req.ChatJID})
 	})
 
 	// Handler for downloading media
@@ -775,7 +888,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +913,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -833,6 +946,8 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	ensureReadColumn(messageStore)
+	var names *nameRefresher
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -844,6 +959,15 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Receipt:
+			handleOwnReceipt(messageStore, v)
+
+		case *events.MarkChatAsRead:
+			handleMarkChatAsRead(messageStore, v)
+
+		case *events.Contact, *events.PushName, *events.BusinessName:
+			names.Kick()
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -905,7 +1029,11 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Name chats from contacts, now and as contacts change
+	names = startNameRefresher(client, messageStore, logger)
+
 	// Start REST API server
+	registerExtraRoutes(client, messageStore)
 	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
@@ -973,7 +1101,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,9 +1116,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		if resolved := resolveContactName(client, jid); resolved != "" {
+			name = resolved
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender

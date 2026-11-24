@@ -1,3 +1,12 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+# WhatsApp session, messages, downloaded media and transcripts: never published
+whatsapp-bridge/store/
+# Built bridge binary
+whatsapp-bridge/whatsapp-bridge
+# Whisper models (download them, see README)
+models/
+# Python
+__pycache__/
+.venv/

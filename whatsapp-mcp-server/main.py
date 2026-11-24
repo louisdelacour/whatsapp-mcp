@@ -10,10 +10,16 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    send_message_full as whatsapp_send_message_full,
+    edit_message as whatsapp_edit_message,
+    list_unread as whatsapp_list_unread,
+    mark_as_read as whatsapp_mark_as_read,
+    delete_message as whatsapp_delete_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from transcribe import cached_transcript, transcribe_message
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -157,7 +163,8 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    reply_to: Optional[str] = None
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -165,6 +172,7 @@ def send_message(
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
+        reply_to: Optional id of a message in the same chat to reply to (quoted, as when you swipe to reply)
     
     Returns:
         A dictionary containing success status and a status message
@@ -176,12 +184,65 @@ def send_message(
             "message": "Recipient must be provided"
         }
     
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    # Returns success, message, and the sent message's message_id and chat_jid (to edit or delete it later)
+    return whatsapp_send_message_full(recipient, message, reply_to)
+
+
+@mcp.tool()
+def list_unread(days: int = 7) -> Dict[str, Any]:
+    """List chats with unread messages: messages others sent after you last read the chat (on any of
+    your devices) or last wrote in it. Most recent first.
+
+    Args:
+        days: Only chats with a message in the last N days (default 7)
+
+    Returns:
+        A dictionary with the chats: chat_jid, name, unread count, last_message_time
+    """
+    return whatsapp_list_unread(days)
+
+
+@mcp.tool()
+def mark_as_read(chat_jid: str) -> Dict[str, Any]:
+    """Mark a chat as read: sends read receipts (blue ticks) for its unread messages.
+
+    Args:
+        chat_jid: The chat's JID, as returned by list_unread or list_chats
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    return whatsapp_mark_as_read(chat_jid)
+
+
+@mcp.tool()
+def edit_message(chat_jid: str, message_id: str, message: str) -> Dict[str, Any]:
+    """Edit the text of a message you sent. WhatsApp only allows this within about 15 minutes of sending.
+
+    Args:
+        chat_jid: The chat's JID (e.g. "33612345678@s.whatsapp.net" or a group "...@g.us"), as returned by
+                  send_message or list_messages
+        message_id: The id of your message, as returned by send_message or list_messages
+        message: The new text
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    return whatsapp_edit_message(chat_jid, message_id, message)
+
+
+@mcp.tool()
+def delete_message(chat_jid: str, message_id: str) -> Dict[str, Any]:
+    """Delete a message you sent, for everyone in the chat (WhatsApp allows this for about 2 days).
+
+    Args:
+        chat_jid: The chat's JID, as returned by send_message or list_messages
+        message_id: The id of your message, as returned by send_message or list_messages
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    return whatsapp_delete_message(chat_jid, message_id)
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
@@ -245,6 +306,29 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def transcribe_voice(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Transcribe a voice/audio message to text, locally on this Mac (whisper.cpp, nothing is sent anywhere).
+    A message already transcribed comes back at once from the cache.
+
+    Args:
+        message_id: The ID of the audio message, as shown by list_messages ("[audio - Message ID: ...]")
+        chat_jid: The JID of the chat containing the message
+
+    Returns:
+        A dictionary with success and the transcribed text
+    """
+    cached = cached_transcript(message_id, chat_jid)
+    if cached is not None:
+        return {"success": True, "text": cached, "cached": True}
+    path = whatsapp_download_media(message_id, chat_jid)
+    if not path:
+        return {"success": False, "message": "Could not download the audio of this message"}
+    try:
+        return transcribe_message(message_id, chat_jid, path)
+    except Exception as e:
+        return {"success": False, "message": f"Transcription failed: {e}"}
 
 if __name__ == "__main__":
     # Initialize and run the server

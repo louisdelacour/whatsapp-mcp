@@ -1,14 +1,38 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+SESSION_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+
+
+def contact_name(jid_or_user: str) -> Optional[str]:
+    """The name WhatsApp knows for a person (address book, first, WhatsApp or business name), or None."""
+    user = jid_or_user.split('@')[0]
+    try:
+        conn = sqlite3.connect(f"file:{SESSION_DB_PATH}?mode=ro", uri=True)
+        try:
+            jids = [f"{user}@s.whatsapp.net", f"{user}@lid"]
+            row = conn.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
+            if row:
+                jids.insert(0, f"{row[0]}@s.whatsapp.net")
+            for jid in jids:
+                row = conn.execute(
+                    "SELECT COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''), NULLIF(push_name, ''), NULLIF(business_name, '')) "
+                    "FROM whatsmeow_contacts WHERE their_jid = ?", (jid,)).fetchone()
+                if row and row[0]:
+                    return row[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return None
 
 @dataclass
 class Message:
@@ -79,10 +103,9 @@ def get_sender_name(sender_jid: str) -> str:
             
             result = cursor.fetchone()
         
-        if result and result[0]:
+        if result and result[0] and not result[0].isdigit():
             return result[0]
-        else:
-            return sender_jid
+        return contact_name(sender_jid) or (result[0] if result and result[0] else sender_jid)
         
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
@@ -100,9 +123,10 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
         
-    content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+    else:
+        content_prefix = f"[Message ID: {message.id} - Chat JID: {message.chat_jid}] "
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
@@ -649,6 +673,57 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def send_message_full(recipient: str, message: str, reply_to: Optional[str] = None) -> Dict[str, Any]:
+    """Send a text message and return the bridge's answer, with the sent message's id and chat."""
+    try:
+        payload = {"recipient": recipient, "message": message}
+        if reply_to:
+            payload["reply_to"] = reply_to
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/send", json=payload)
+        try:
+            return response.json()
+        except ValueError:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+
+
+def list_unread(days: int = 7) -> Dict[str, Any]:
+    try:
+        return requests.get(f"{WHATSAPP_API_BASE_URL}/unread", params={"days": days}).json()
+    except (requests.RequestException, ValueError) as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+
+
+def mark_as_read(chat_jid: str) -> Dict[str, Any]:
+    try:
+        return requests.post(f"{WHATSAPP_API_BASE_URL}/mark_read", json={"chat_jid": chat_jid}).json()
+    except (requests.RequestException, ValueError) as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+
+
+def edit_message(chat_jid: str, message_id: str, message: str) -> Dict[str, Any]:
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/edit", json={"chat_jid": chat_jid, "message_id": message_id, "message": message})
+        try:
+            return response.json()
+        except ValueError:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+
+
+def delete_message(chat_jid: str, message_id: str) -> Dict[str, Any]:
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/delete", json={"chat_jid": chat_jid, "message_id": message_id})
+        try:
+            return response.json()
+        except ValueError:
+            return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+
 
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
